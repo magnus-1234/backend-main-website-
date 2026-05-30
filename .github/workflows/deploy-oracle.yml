@@ -1,0 +1,73 @@
+name: Deploy Website Backend
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install and build
+        run: |
+          npm ci
+          npm run build
+
+      - name: Package backend
+        run: |
+          tar \
+            --exclude=node_modules \
+            --exclude=dist \
+            --exclude=.git \
+            -czf backend.tar.gz \
+            src package.json package-lock.json tsconfig.json ecosystem.config.js
+
+      - name: Configure SSH
+        env:
+          ORACLE_SSH_KEY: ${{ secrets.ORACLE_SSH_KEY }}
+          ORACLE_HOST: ${{ secrets.ORACLE_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$ORACLE_SSH_KEY" > ~/.ssh/oracle_key
+          chmod 600 ~/.ssh/oracle_key
+          ssh-keyscan -H "$ORACLE_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload package
+        env:
+          ORACLE_HOST: ${{ secrets.ORACLE_HOST }}
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+          ORACLE_TARGET_DIR: ${{ secrets.ORACLE_TARGET_DIR }}
+        run: |
+          ssh -i ~/.ssh/oracle_key "$ORACLE_USER@$ORACLE_HOST" "mkdir -p '$ORACLE_TARGET_DIR'"
+          scp -i ~/.ssh/oracle_key backend.tar.gz "$ORACLE_USER@$ORACLE_HOST:$ORACLE_TARGET_DIR/backend.tar.gz"
+
+      - name: Deploy on Oracle
+        env:
+          ORACLE_HOST: ${{ secrets.ORACLE_HOST }}
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+          ORACLE_TARGET_DIR: ${{ secrets.ORACLE_TARGET_DIR }}
+        run: |
+          ssh -i ~/.ssh/oracle_key "$ORACLE_USER@$ORACLE_HOST" << EOF
+            set -e
+            cd "$ORACLE_TARGET_DIR"
+            tar -xzf backend.tar.gz
+            npm ci
+            npm run build
+            npx pm2 delete whiteoutsurvival_backend 2>/dev/null || true
+            npx pm2 start ecosystem.config.js --env production
+            npx pm2 save
+            curl -fsS http://localhost:3001/api/health
+          EOF
