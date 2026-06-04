@@ -57,6 +57,26 @@ type IslandCommentDocument = {
   createdAt: Date;
 };
 
+type MessageTemplateDocument = {
+  _id?: ObjectId;
+  id: string;
+  title: string;
+  category: string;
+  categories: string[];
+  description: string;
+  text: string;
+  rawText: string;
+  imageUrl: string;
+  tags: string[];
+  creatorName: string;
+  creatorUserId: string | null;
+  likes: number;
+  shares: number;
+  createdAt: Date;
+  updatedAt: Date;
+  builtin: boolean;
+};
+
 type AuthProvider = 'google' | 'discord';
 
 type LinkedPlayerAccount = PlayerProfile & {
@@ -126,6 +146,12 @@ const upload = multer({
 });
 
 const maxUploadBytes = Number(process.env.DAYBREAK_MAX_UPLOAD_BYTES || 8 * 1024 * 1024);
+const templateUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: Number(process.env.MESSAGE_TEMPLATE_MAX_UPLOAD_BYTES || 2 * 1024 * 1024),
+  },
+});
 
 let mongoClient: MongoClient | null = null;
 let mongoDb: Db | null = null;
@@ -164,6 +190,18 @@ const parseTags = (value: unknown) => {
     .slice(0, 8);
 };
 
+const parseTemplateTags = (value: unknown) => {
+  if (typeof value !== 'string') {
+    return [];
+  }
+
+  return value
+    .split(/[\s,#]+/)
+    .map((tag) => tag.trim())
+    .filter(Boolean)
+    .slice(0, 12);
+};
+
 const cleanText = (value: unknown, maxLength: number) => {
   if (typeof value !== 'string') {
     return '';
@@ -171,6 +209,8 @@ const cleanText = (value: unknown, maxLength: number) => {
 
   return value.trim().replace(/\s+/g, ' ').slice(0, maxLength);
 };
+
+const normalizeCopyText = (value: unknown) => (typeof value === 'string' ? value : '').replace(/\r\n?/g, '\n');
 
 const cleanPlayerId = (value: unknown) => cleanText(value, 16).replace(/\D/g, '');
 
@@ -434,7 +474,7 @@ const getDb = async () => {
     serverSelectionTimeoutMS: Number(process.env.MONGODB_SERVER_SELECTION_TIMEOUT_MS || 5000),
   });
   await mongoClient.connect();
-  mongoDb = mongoClient.db(process.env.MONGODB_DB || 'whiteoutsurvival_dev');
+  mongoDb = mongoClient.db(process.env.MONGODB_DB || process.env.MONGO_DB_NAME || process.env.MONGO_DB_WOS || process.env.MONGO_DB || 'whiteoutsurvival_dev');
   return mongoDb;
 };
 
@@ -443,6 +483,7 @@ const getCollections = async () => {
   const islands = db.collection<IslandDocument>('daybreak_islands');
   const likes = db.collection<IslandLikeDocument>('daybreak_island_likes');
   const comments = db.collection<IslandCommentDocument>('daybreak_island_comments');
+  const messageTemplates = db.collection<MessageTemplateDocument>('message_templates');
   const users = db.collection<UserDocument>('users');
   const sessions = db.collection<SessionDocument>('auth_sessions');
   const oauthStates = db.collection<OAuthStateDocument>('auth_oauth_states');
@@ -453,6 +494,11 @@ const getCollections = async () => {
     islands.createIndex({ playerId: 1 }),
     likes.createIndex({ islandId: 1, viewerId: 1 }, { unique: true }),
     comments.createIndex({ islandId: 1, createdAt: -1 }),
+    messageTemplates.createIndex({ createdAt: -1 }),
+    messageTemplates.createIndex({ likes: -1, shares: -1, createdAt: -1 }),
+    messageTemplates.createIndex({ category: 1 }),
+    messageTemplates.createIndex({ categories: 1 }),
+    messageTemplates.createIndex({ creatorUserId: 1, createdAt: -1 }),
     users.createIndex({ 'providers.provider': 1, 'providers.providerUserId': 1 }),
     users.createIndex({ email: 1 }, { sparse: true }),
     users.createIndex({ 'playerAccounts.playerId': 1 }),
@@ -463,7 +509,7 @@ const getCollections = async () => {
   ]).then(() => undefined);
 
   await indexesReady;
-  return { islands, likes, comments, users, sessions, oauthStates };
+  return { islands, likes, comments, messageTemplates, users, sessions, oauthStates };
 };
 
 const toIslandResponse = (island: IslandDocument) => ({
@@ -490,6 +536,80 @@ const toCommentResponse = (comment: IslandCommentDocument) => ({
   authorName: comment.authorName,
   message: comment.message,
   createdAt: comment.createdAt.toISOString(),
+});
+
+const validTemplateCategories = new Set([
+  'state-transfer-chat',
+  'unicodes',
+  'emojis',
+  'funny',
+  'alliance-recruit',
+  'various',
+  'leaders',
+  'nsfw',
+]);
+
+const templateUserIdFrom = (req: Request) =>
+  cleanText(req.get('x-user-id'), 120) || cleanText(req.body?.creatorUserId, 120);
+
+const parseTemplateCategories = (body: Record<string, unknown>) => {
+  const primary = cleanText(body.category, 80) || 'state-transfer-chat';
+  const rawCategories = Array.isArray(body.categories) ? body.categories : [body.categories];
+  const selected = [primary, ...rawCategories]
+    .map((value) => cleanText(value, 80))
+    .filter((value) => validTemplateCategories.has(value));
+  const unique = Array.from(new Set(selected)).slice(0, 8);
+  return unique.length ? unique : ['state-transfer-chat'];
+};
+
+const templateImageUrlFrom = (req: UploadedRequest) => {
+  const imageUrl = normalizeExternalImageUrl(req.body?.imageUrl);
+  if (imageUrl) {
+    return imageUrl;
+  }
+  if (!req.file) {
+    return '';
+  }
+  return `data:${req.file.mimetype || 'application/octet-stream'};base64,${req.file.buffer.toString('base64')}`;
+};
+
+const templatePayloadFrom = (req: UploadedRequest, existing?: MessageTemplateDocument) => {
+  const categories = parseTemplateCategories(req.body || {});
+  const text = normalizeCopyText(req.body?.text);
+  const now = new Date();
+  return {
+    title: cleanText(req.body?.title, 90) || 'Untitled template',
+    category: categories[0],
+    categories,
+    description: cleanText(req.body?.description, 360),
+    text,
+    rawText: text,
+    imageUrl: templateImageUrlFrom(req) || existing?.imageUrl || '',
+    tags: parseTemplateTags(req.body?.tags),
+    creatorName: cleanText(req.body?.creatorName, 80) || existing?.creatorName || 'Community',
+    creatorUserId: cleanText(req.body?.creatorUserId, 120) || existing?.creatorUserId || null,
+    updatedAt: now,
+  };
+};
+
+const toTemplateResponse = (template: MessageTemplateDocument, userId = '') => ({
+  id: template.id,
+  title: template.title,
+  category: template.category,
+  categories: template.categories || [template.category],
+  description: template.description,
+  text: normalizeCopyText(template.text),
+  rawText: normalizeCopyText(template.rawText || template.text),
+  imageUrl: template.imageUrl,
+  tags: template.tags || [],
+  creatorName: template.creatorName,
+  creatorUserId: template.creatorUserId,
+  likes: template.likes || 0,
+  shares: template.shares || 0,
+  createdAt: template.createdAt instanceof Date ? template.createdAt.toISOString() : template.createdAt,
+  updatedAt: template.updatedAt instanceof Date ? template.updatedAt.toISOString() : template.updatedAt,
+  builtin: Boolean(template.builtin),
+  canManage: Boolean(userId && template.creatorUserId === userId),
 });
 
 const toUserResponse = (user: UserDocument) => ({
@@ -1135,6 +1255,160 @@ app.post('/api/daybreak/islands/:id/share', async (req, res) => {
     res.status(error instanceof Error && error.message.includes('hex string') ? 400 : 500).json({
       error: 'Unable to share island',
     });
+  }
+});
+
+app.get('/api/message-templates', async (req, res) => {
+  try {
+    const { messageTemplates } = await getCollections();
+    const query: Record<string, unknown> = {};
+    const category = cleanText(req.query.category, 80);
+    const tag = cleanText(req.query.tag, 80);
+    if (category && category !== 'all') {
+      query.$or = [{ category }, { categories: category }];
+    }
+    if (tag) {
+      query.tags = { $regex: `^${tag}$`, $options: 'i' };
+    }
+
+    const sort: Sort =
+      req.query.sort === 'recent'
+        ? { createdAt: -1 as const }
+        : { likes: -1 as const, shares: -1 as const, createdAt: -1 as const };
+    const limit = parsePositiveInt(req.query.limit, 80, 100);
+    const userId = cleanText(req.get('x-user-id'), 120);
+    const templates = await messageTemplates.find(query).sort(sort).limit(limit).toArray();
+    res.json({ templates: templates.map((template) => toTemplateResponse(template, userId)), favoriteIds: [] });
+  } catch (error) {
+    sendStorageError(res, error);
+  }
+});
+
+app.post('/api/message-templates', templateUpload.single('image'), async (req: UploadedRequest, res) => {
+  try {
+    const { messageTemplates } = await getCollections();
+    const now = new Date();
+    const payload = templatePayloadFrom(req);
+    const template: MessageTemplateDocument = {
+      id: randomUUID(),
+      ...payload,
+      likes: 0,
+      shares: 0,
+      createdAt: now,
+      builtin: false,
+    };
+    await messageTemplates.insertOne(template);
+    res.status(201).json({ template: toTemplateResponse(template, templateUserIdFrom(req)) });
+  } catch (error) {
+    sendStorageError(res, error);
+  }
+});
+
+app.get('/api/message-templates/me/uploads', async (req, res) => {
+  try {
+    const { messageTemplates } = await getCollections();
+    const userId = cleanText(req.get('x-user-id'), 120);
+    const query = userId ? { creatorUserId: userId } : {};
+    const limit = parsePositiveInt(req.query.limit, 80, 100);
+    const templates = await messageTemplates.find(query).sort({ createdAt: -1 }).limit(limit).toArray();
+    res.json({ templates: templates.map((template) => toTemplateResponse(template, userId)), favoriteIds: [] });
+  } catch (error) {
+    sendStorageError(res, error);
+  }
+});
+
+app.get('/api/message-templates/me/favorites', (_req, res) => {
+  res.json({ templates: [], favoriteIds: [] });
+});
+
+app.patch('/api/message-templates/:id', templateUpload.single('image'), async (req: UploadedRequest, res) => {
+  try {
+    const { messageTemplates } = await getCollections();
+    const existing = await messageTemplates.findOne({ id: req.params.id });
+    if (!existing) {
+      res.status(404).json({ error: 'Template not found' });
+      return;
+    }
+
+    const userId = templateUserIdFrom(req);
+    if (existing.creatorUserId && userId && existing.creatorUserId !== userId) {
+      res.status(403).json({ error: 'You can only edit your own templates' });
+      return;
+    }
+
+    const payload = templatePayloadFrom(req, existing);
+    await messageTemplates.updateOne({ id: req.params.id }, { $set: payload });
+    const updated = await messageTemplates.findOne({ id: req.params.id });
+    res.json({ template: toTemplateResponse(updated || { ...existing, ...payload }, userId) });
+  } catch (error) {
+    sendStorageError(res, error);
+  }
+});
+
+app.delete('/api/message-templates/:id', async (req, res) => {
+  try {
+    const { messageTemplates } = await getCollections();
+    const existing = await messageTemplates.findOne({ id: req.params.id });
+    if (!existing) {
+      res.status(404).json({ error: 'Template not found' });
+      return;
+    }
+
+    const userId = cleanText(req.get('x-user-id'), 120);
+    if (existing.creatorUserId && userId && existing.creatorUserId !== userId) {
+      res.status(403).json({ error: 'You can only delete your own templates' });
+      return;
+    }
+
+    await messageTemplates.deleteOne({ id: req.params.id });
+    res.json({ status: 'success' });
+  } catch (error) {
+    sendStorageError(res, error);
+  }
+});
+
+app.post('/api/message-templates/:id/like', async (req, res) => {
+  try {
+    const { messageTemplates } = await getCollections();
+    await messageTemplates.updateOne({ id: req.params.id }, { $inc: { likes: 1 } });
+    const template = await messageTemplates.findOne({ id: req.params.id });
+    if (!template) {
+      res.status(404).json({ error: 'Template not found' });
+      return;
+    }
+    res.json({ template: toTemplateResponse(template, cleanText(req.get('x-user-id'), 120)) });
+  } catch (error) {
+    sendStorageError(res, error);
+  }
+});
+
+app.delete('/api/message-templates/:id/like', async (req, res) => {
+  try {
+    const { messageTemplates } = await getCollections();
+    await messageTemplates.updateOne({ id: req.params.id, likes: { $gt: 0 } }, { $inc: { likes: -1 } });
+    const template = await messageTemplates.findOne({ id: req.params.id });
+    if (!template) {
+      res.status(404).json({ error: 'Template not found' });
+      return;
+    }
+    res.json({ template: toTemplateResponse(template, cleanText(req.get('x-user-id'), 120)) });
+  } catch (error) {
+    sendStorageError(res, error);
+  }
+});
+
+app.post('/api/message-templates/:id/share', async (req, res) => {
+  try {
+    const { messageTemplates } = await getCollections();
+    await messageTemplates.updateOne({ id: req.params.id }, { $inc: { shares: 1 } });
+    const template = await messageTemplates.findOne({ id: req.params.id });
+    if (!template) {
+      res.status(404).json({ error: 'Template not found' });
+      return;
+    }
+    res.json({ template: toTemplateResponse(template, cleanText(req.get('x-user-id'), 120)) });
+  } catch (error) {
+    sendStorageError(res, error);
   }
 });
 
